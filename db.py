@@ -17,9 +17,15 @@ def setup():
             cron_expr       TEXT,
             created_by      TEXT NOT NULL,
             roster_list     TEXT,
-            advance_roster  INTEGER DEFAULT 1
+            advance_roster  INTEGER DEFAULT 1,
+            last_run        TEXT
         )
     """)
+    # migrate existing tables that predate the last_run column
+    try:
+        cursor.execute("ALTER TABLE scheduled_messages ADD COLUMN last_run TEXT")
+    except sqlite3.OperationalError:
+        pass  # column already exists
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS custom_jobs (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -62,6 +68,13 @@ def get_all_messages():
     rows = cursor.fetchall()
     conn.close()
     return rows
+
+def update_message_last_run(message_id: int, last_run: str):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE scheduled_messages SET last_run = ? WHERE id = ?", (last_run, message_id))
+    conn.commit()
+    conn.close()
 
 def delete_message(message_id: int):
     conn = get_connection()

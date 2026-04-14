@@ -37,7 +37,7 @@ async def job_runner():
     now_utc = datetime.now(pytz.utc)
     rows = db.get_all_messages()
     for row in rows:
-        row_id, channel_ids_str, message, fire_at, cron_expr, created_by, roster_list, advance_roster = row
+        row_id, channel_ids_str, message, fire_at, cron_expr, created_by, roster_list, advance_roster, last_run = row
 
         user_tz = get_tz_for_user(created_by)
         now_local = now_utc.astimezone(user_tz)
@@ -48,9 +48,17 @@ async def job_runner():
             prev = cron.get_prev(datetime)
             if prev.tzinfo is None:
                 prev = user_tz.localize(prev)
-            if (now_local - prev).total_seconds() <= 60:
+            if (now_local - prev).total_seconds() < 60:
+                # skip if we already fired for this cron occurrence
+                if last_run:
+                    last_run_dt = datetime.fromisoformat(last_run)
+                    if last_run_dt.tzinfo is None:
+                        last_run_dt = user_tz.localize(last_run_dt)
+                    if abs((last_run_dt - prev).total_seconds()) < 60:
+                        continue
                 channel_ids = ast.literal_eval(channel_ids_str)
                 await sched.send_to_channels(client, channel_ids, message, roster_list, bool(advance_roster))
+                db.update_message_last_run(row_id, now_local.isoformat())
         elif fire_at:
             fire_dt = datetime.fromisoformat(fire_at).astimezone(pytz.utc)
             if now_utc >= fire_dt and (now_utc - fire_dt).total_seconds() <= 60:
@@ -75,7 +83,7 @@ async def custom_job_runner():
         if now.hour == expected_hour and now.minute == expected_minute:
             # check if this is a valid every-other-day slot
             last_run_dt = datetime.fromisoformat(last_run).astimezone(TZ) if last_run else None
-            next_run = sched.get_next_every_other_day(last_run_dt, hour, minute, saturday_hour, saturday_minute, start_date if not last_run else None)
+            next_run = sched.get_next_every_other_day(last_run_dt, hour, minute, saturday_hour, saturday_minute, start_date if not last_run else None, strict_future=False)
 
             if abs((now - next_run).total_seconds()) <= 60:
                 for channel_id in channel_ids:
@@ -165,7 +173,7 @@ async def listschedules(interaction: discord.Interaction):
 
     lines = []
     for row in rows:
-        row_id, channel_ids_str, message, fire_at, cron_expr, created_by, roster_list, advance_roster = row
+        row_id, channel_ids_str, message, fire_at, cron_expr, created_by, roster_list, advance_roster, _last_run = row
         user_tz = get_tz_for_user(interaction.user.id)
 
         if cron_expr:
@@ -340,11 +348,14 @@ async def scheduleeveryotherday(
 
 @tree.command(name="listcustomjobs", description="List all every-other-day jobs")
 async def listcustomjobs(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
     rows = db.get_all_custom_jobs()
     if not rows:
-        await interaction.response.send_message("No custom jobs scheduled.", ephemeral=True)
+        await interaction.followup.send("No custom jobs scheduled.", ephemeral=True)
         return
 
+    user_tz = get_tz_for_user(interaction.user.id)
     lines = []
     for row in rows:
         job_id, channel_ids_str, message, hour, minute, saturday_hour, saturday_minute, start_date, last_run, _ = row
@@ -356,7 +367,6 @@ async def listcustomjobs(interaction: discord.Interaction):
             start_date if not last_run else None
         )
 
-        user_tz = get_tz_for_user(interaction.user.id)
         next_run_str = format_dt(next_run, user_tz)
 
         last = last_run if last_run else "never"
@@ -367,7 +377,7 @@ async def listcustomjobs(interaction: discord.Interaction):
             f"| start: {start} | last run: {last} | next run: {next_run_str} | {message[:100]}{'...' if len(message) > 100 else ''}"
         )
 
-    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
 
 @tree.command(name="deletecustomjob", description="Delete an every-other-day job by ID")
 @app_commands.describe(id="The job ID from /listcustomjobs")

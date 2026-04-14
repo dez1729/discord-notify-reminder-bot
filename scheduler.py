@@ -25,7 +25,16 @@ async def send_to_channels(bot, channel_ids: list, message: str, roster_list: st
         except Exception as e:
             print(f"Failed to send to channel {channel_id}: {e}")
 
-def get_next_every_other_day(last_run: datetime, hour: int, minute: int, saturday_hour: int, saturday_minute: int, start_date: str = None) -> datetime:
+def get_next_every_other_day(last_run: datetime, hour: int, minute: int, saturday_hour: int, saturday_minute: int, start_date: str = None, strict_future: bool = True) -> datetime:
+    """Return the next scheduled every-other-day slot.
+
+    strict_future=True  (default, used by listing commands): always returns a
+        strictly future time — walks past now even if now falls in the same minute
+        as a scheduled slot.
+    strict_future=False (used by the runner): stops as soon as the candidate
+        reaches the current minute, so the current slot is returned rather than
+        overshooting 2 days forward due to sub-minute rounding.
+    """
     tz = pytz.timezone("America/Vancouver")
     now = datetime.now(tz)
 
@@ -39,13 +48,14 @@ def get_next_every_other_day(last_run: datetime, hour: int, minute: int, saturda
     else:
         anchor = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
 
-    # walk forward from anchor in 2-day steps until we find a slot at or after now
-    # compare at minute granularity — anchor has second=0 from .replace(), so using
-    # <= would overshoot when now has non-zero seconds within the same minute
-    now_min = now.replace(second=0, microsecond=0)
     candidate = anchor
-    while candidate < now_min:
-        candidate += timedelta(days=2)
+    if strict_future:
+        while candidate <= now:
+            candidate += timedelta(days=2)
+    else:
+        now_min = now.replace(second=0, microsecond=0)
+        while candidate < now_min:
+            candidate += timedelta(days=2)
 
     # apply the regular time (in case anchor had a different time)
     candidate = candidate.replace(hour=hour, minute=minute, second=0, microsecond=0)
