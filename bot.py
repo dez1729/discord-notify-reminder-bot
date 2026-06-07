@@ -1,4 +1,6 @@
 import os
+import sys
+import atexit
 import discord
 from discord import app_commands
 from dotenv import load_dotenv
@@ -7,11 +9,33 @@ import scheduler as sched
 from typing import Literal
 import roster
 from discord.ext import tasks
-from datetime import datetime
+from datetime import datetime, date as dt_date, timedelta, time as dt_time
 import pytz
 import ast
 
 TZ = pytz.timezone("America/Vancouver")
+
+PID_FILE = "bot.pid"
+
+def _acquire_pid_file():
+    if os.path.exists(PID_FILE):
+        try:
+            with open(PID_FILE) as f:
+                old_pid = int(f.read().strip())
+            if old_pid != os.getpid():
+                os.kill(old_pid, 0)  # raises OSError if process is gone
+                print(f"[startup] Another instance is already running (PID {old_pid}). Exiting.")
+                sys.exit(1)
+        except (OSError, ValueError):
+            pass  # stale PID file from a crashed run
+    with open(PID_FILE, "w") as f:
+        f.write(str(os.getpid()))
+    atexit.register(lambda: os.path.exists(PID_FILE) and os.remove(PID_FILE))
+
+_acquire_pid_file()
+
+WEEKDAY_MAP = {"monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3, "friday": 4, "saturday": 5, "sunday": 6}
+WEEKDAY_SHORT = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri", 5: "Sat", 6: "Sun"}
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -37,7 +61,8 @@ async def job_runner():
     now_utc = datetime.now(pytz.utc)
     rows = db.get_all_messages()
     for row in rows:
-        row_id, channel_ids_str, message, fire_at, cron_expr, created_by, roster_list, advance_roster, last_run = row
+        row_id, channel_ids_str, message, fire_at, cron_expr, created_by, roster_list, advance_roster, last_run, \
+            interval_days, interval_time, interval_start, interval_skip_weekday = row
 
         user_tz = get_tz_for_user(created_by)
         now_local = now_utc.astimezone(user_tz)
@@ -59,46 +84,36 @@ async def job_runner():
                 channel_ids = ast.literal_eval(channel_ids_str)
                 await sched.send_to_channels(client, channel_ids, message, roster_list, bool(advance_roster))
                 db.update_message_last_run(row_id, now_local.isoformat())
+        elif interval_days:
+            start = dt_date.fromisoformat(interval_start)
+            today = now_local.date()
+            days_elapsed = (today - start).days
+            if days_elapsed < 0:
+                continue
+            if days_elapsed % interval_days != 0:
+                continue
+            if interval_skip_weekday is not None and today.weekday() == interval_skip_weekday:
+                continue
+            fire_h, fire_m = map(int, interval_time.split(":"))
+            if now_local.hour != fire_h or now_local.minute != fire_m:
+                continue
+            if last_run:
+                last_run_dt = datetime.fromisoformat(last_run)
+                if last_run_dt.tzinfo is None:
+                    last_run_dt = user_tz.localize(last_run_dt)
+                if last_run_dt.astimezone(user_tz).date() == today:
+                    continue
+            channel_ids = ast.literal_eval(channel_ids_str)
+            await sched.send_to_channels(client, channel_ids, message, roster_list, bool(advance_roster))
+            db.update_message_last_run(row_id, now_local.isoformat())
         elif fire_at:
             fire_dt = datetime.fromisoformat(fire_at).astimezone(pytz.utc)
             if now_utc >= fire_dt and (now_utc - fire_dt).total_seconds() <= 60:
                 channel_ids = ast.literal_eval(channel_ids_str)
                 await sched.send_to_channels(client, channel_ids, message, roster_list, bool(advance_roster))
 
-@tasks.loop(minutes=1)
-async def custom_job_runner():
-    now = datetime.now(TZ)
-    rows = db.get_all_custom_jobs()
-    for row in rows:
-        job_id, channel_ids_str, message, hour, minute, saturday_hour, saturday_minute, start_date, last_run, _ = row
-        channel_ids = ast.literal_eval(channel_ids_str)
-
-        # figure out what time to expect today
-        if now.weekday() == 5:  # Saturday
-            expected_hour, expected_minute = saturday_hour, saturday_minute
-        else:
-            expected_hour, expected_minute = hour, minute
-
-        # check if we should fire now
-        if now.hour == expected_hour and now.minute == expected_minute:
-            # check if this is a valid every-other-day slot
-            last_run_dt = datetime.fromisoformat(last_run).astimezone(TZ) if last_run else None
-            next_run = sched.get_next_every_other_day(last_run_dt, hour, minute, saturday_hour, saturday_minute, start_date if not last_run else None, strict_future=False)
-
-            if abs((now - next_run).total_seconds()) <= 60:
-                for channel_id in channel_ids:
-                    channel = client.get_channel(int(channel_id))
-                    if channel:
-                        await channel.send(message)
-                db.update_custom_job_last_run(job_id, now.isoformat())
-                print(f"Custom job {job_id} fired at {now}")
-
 @job_runner.before_loop
 async def before_job_runner():
-    await client.wait_until_ready()
-
-@custom_job_runner.before_loop
-async def before_custom_job_runner():
     await client.wait_until_ready()
 
 @client.event
@@ -114,8 +129,6 @@ async def on_ready():
 
     if not job_runner.is_running():
         job_runner.start()
-    if not custom_job_runner.is_running():
-        custom_job_runner.start()
 
 @tree.command(name="schedule", description="Schedule a message to one or more channels")
 @app_commands.describe(
@@ -124,7 +137,11 @@ async def on_ready():
     time="One-shot datetime e.g. 2026-04-20T09:00:00 — interpreted in your set timezone",
     cron="Cron expression e.g. '0 9 * * 1' for every Monday 9am — interpreted in your set timezone",
     roster_list="If using {roster} in your message, which list to use",
-    advance_roster="Whether to advance the roster after sending"
+    advance_roster="Whether to advance the roster after sending",
+    interval_days="Interval mode: run every X days",
+    interval_time="Interval mode: time of day HH:MM e.g. 17:00 — interpreted in your set timezone",
+    interval_start="Interval mode: start date YYYY-MM-DD (defaults to today)",
+    interval_skip_weekday="Interval mode: skip the run if it lands on this weekday"
 )
 async def schedule(
     interaction: discord.Interaction,
@@ -133,11 +150,41 @@ async def schedule(
     time: str = None,
     cron: str = None,
     roster_list: Literal["244", "297"] = None,
-    advance_roster: bool = True
+    advance_roster: bool = True,
+    interval_days: int = None,
+    interval_time: str = None,
+    interval_start: str = None,
+    interval_skip_weekday: Literal["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"] = None,
 ):
-    if not time and not cron:
-        await interaction.response.send_message("You must provide either a time or a cron expression.", ephemeral=True)
+    if not db.claim_interaction(interaction.id):
         return
+
+    using_interval = interval_days is not None or interval_time is not None
+
+    if not time and not cron and not using_interval:
+        await interaction.response.send_message("You must provide either a time, a cron expression, or interval options.", ephemeral=True)
+        return
+
+    if using_interval:
+        if interval_days is None or interval_time is None:
+            await interaction.response.send_message("Interval mode requires both `interval_days` and `interval_time`.", ephemeral=True)
+            return
+        try:
+            fire_h, fire_m = map(int, interval_time.split(":"))
+            if not (0 <= fire_h <= 23 and 0 <= fire_m <= 59):
+                raise ValueError
+        except ValueError:
+            await interaction.response.send_message("Invalid `interval_time`. Use HH:MM e.g. `17:00`.", ephemeral=True)
+            return
+        if interval_start:
+            try:
+                dt_date.fromisoformat(interval_start)
+            except ValueError:
+                await interaction.response.send_message("Invalid `interval_start`. Use YYYY-MM-DD e.g. `2026-06-06`.", ephemeral=True)
+                return
+        else:
+            user_tz = get_tz_for_user(interaction.user.id)
+            interval_start = datetime.now(user_tz).strftime("%Y-%m-%d")
 
     if "{roster}" in message and not roster_list:
         await interaction.response.send_message("You used {roster} but didn't pick a roster list.", ephemeral=True)
@@ -161,20 +208,31 @@ async def schedule(
             await interaction.response.send_message("Invalid time format. Use e.g. `2026-04-20T09:00:00`", ephemeral=True)
             return
 
-    row_id = db.add_message(channel_ids, message, fire_at_utc, cron, str(interaction.user.id), roster_list, advance_roster)
+    skip_weekday_int = WEEKDAY_MAP[interval_skip_weekday] if interval_skip_weekday else None
+
+    row_id = db.add_message(
+        channel_ids, message, fire_at_utc, cron, str(interaction.user.id), roster_list, advance_roster,
+        interval_days=interval_days if using_interval else None,
+        interval_time=interval_time if using_interval else None,
+        interval_start=interval_start if using_interval else None,
+        interval_skip_weekday=skip_weekday_int,
+    )
     await interaction.response.send_message(f"Scheduled! ID: `{row_id}`", ephemeral=True)
 
 @tree.command(name="listschedules", description="List all scheduled messages")
 async def listschedules(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
     rows = db.get_all_messages()
     if not rows:
-        await interaction.response.send_message("No scheduled messages.", ephemeral=True)
+        await interaction.followup.send("No scheduled messages.", ephemeral=True)
         return
 
+    user_tz = get_tz_for_user(interaction.user.id)
     lines = []
     for row in rows:
-        row_id, channel_ids_str, message, fire_at, cron_expr, created_by, roster_list, advance_roster, _last_run = row
-        user_tz = get_tz_for_user(interaction.user.id)
+        row_id, channel_ids_str, message, fire_at, cron_expr, created_by, roster_list, advance_roster, _last_run, \
+            interval_days, interval_time, interval_start, interval_skip_weekday = row
+        interval_desc = ""
 
         if cron_expr:
             from croniter import croniter
@@ -186,6 +244,33 @@ async def listschedules(interaction: discord.Interaction):
                 next_run = next_run.replace(tzinfo=None)
 
             next_run_str = format_dt(TZ.localize(next_run), user_tz)
+        elif interval_days:
+            now_local = datetime.now(user_tz)
+            today = now_local.date()
+            start = dt_date.fromisoformat(interval_start)
+            fire_h, fire_m = map(int, interval_time.split(":"))
+
+            days_elapsed = (today - start).days
+            if days_elapsed < 0:
+                candidate = start
+            else:
+                remainder = days_elapsed % interval_days
+                if remainder == 0:
+                    fire_today = now_local.replace(hour=fire_h, minute=fire_m, second=0, microsecond=0)
+                    candidate = today if now_local < fire_today else today + timedelta(days=interval_days)
+                else:
+                    candidate = today + timedelta(days=interval_days - remainder)
+
+            iters = 0
+            while interval_skip_weekday is not None and candidate.weekday() == interval_skip_weekday:
+                candidate += timedelta(days=interval_days)
+                iters += 1
+                if iters > 365:
+                    break
+
+            next_run_str = format_dt(user_tz.localize(datetime.combine(candidate, dt_time(fire_h, fire_m))), user_tz)
+            skip_part = f", skip {WEEKDAY_SHORT[interval_skip_weekday]}" if interval_skip_weekday is not None else ""
+            interval_desc = f" | every {interval_days}d at {interval_time} from {interval_start}{skip_part}"
         elif fire_at:
             fire_dt = datetime.fromisoformat(fire_at).astimezone(TZ)
             next_run_str = format_dt(fire_dt, user_tz)
@@ -208,21 +293,40 @@ async def listschedules(interaction: discord.Interaction):
             #     roster_info = f" | next up: {current_name} ({current_index+1}/{total}) from roster {roster_list}"
 
         lines.append(
-            f"`ID {row_id}` | next run: {next_run_str}{roster_info} | {message[:100]}{'...' if len(message) > 100 else ''}"
+            f"`ID {row_id}` | next run: {next_run_str}{interval_desc}{roster_info} | {message[:100]}{'...' if len(message) > 100 else ''}"
         )
 
-    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+    chunks = []
+    current = []
+    current_len = 0
+    for line in lines:
+        if current_len + len(line) + 1 > 1900:
+            chunks.append("\n".join(current))
+            current = []
+            current_len = 0
+        current.append(line)
+        current_len += len(line) + 1
+    if current:
+        chunks.append("\n".join(current))
+
+    await interaction.followup.send(chunks[0], ephemeral=True)
+    for chunk in chunks[1:]:
+        await interaction.followup.send(chunk, ephemeral=True)
 
 
 @tree.command(name="deleteschedule", description="Delete a scheduled message by ID")
 @app_commands.describe(id="The schedule ID from /listschedules")
 async def deleteschedule(interaction: discord.Interaction, id: int):
+    existed = db.row_exists(id)
+    await interaction.response.defer(ephemeral=True)
+    if not db.claim_interaction(interaction.id):
+        await interaction.followup.send("Already handled.", ephemeral=True)
+        return
     deleted = db.delete_message(id)
-
-    if deleted:
-        await interaction.response.send_message(f"Deleted schedule `{id}`.", ephemeral=True)
+    if deleted or existed:
+        await interaction.followup.send(f"Deleted schedule `{id}`.", ephemeral=True)
     else:
-        await interaction.response.send_message(f"No schedule found with ID `{id}`.", ephemeral=True)
+        await interaction.followup.send(f"No schedule found with ID `{id}`.", ephemeral=True)
 
 
 @tree.command(name="roster", description="Show a roster list and who is up today")
@@ -284,8 +388,11 @@ async def scheduleadvance(
     cron: str = None,
     time: str = None
 ):
+    if not db.claim_interaction(interaction.id):
+        return
+
     if not time and not cron:
-        await interaction.response.send_message("You must provide either a time or a cron expression.", ephemeral=True)
+        await interaction.response.send_message("You must provide either a time or a cron expression...", ephemeral=True)
         return
 
     # reuse the schedule infrastructure with a sentinel message
@@ -293,101 +400,6 @@ async def scheduleadvance(
 
     timing = cron if cron else time
     await interaction.response.send_message(f"Roster {list_name} will advance on schedule: `{timing}` (ID: `{row_id}`)", ephemeral=True)
-
-@tree.command(name="scheduleeveryotherday", description="Schedule a message every other day, moving to Saturday if it falls on Friday")
-@app_commands.describe(
-    channels="Channel mentions e.g. #general #announcements",
-    message="The message to send",
-    hour="Hour to send on regular days (24h, in your set timezone)",
-    minute="Minute to send on regular days",
-    saturday_hour="Hour to send if moved to Saturday (24h, in your set timezone)",
-    saturday_minute="Minute to send if moved to Saturday",
-    start_date="Date of the first run e.g. 2026-04-11"
-)
-async def scheduleeveryotherday(
-    interaction: discord.Interaction,
-    channels: str,
-    message: str,
-    hour: int,
-    minute: int,
-    saturday_hour: int,
-    saturday_minute: int,
-    start_date: str = None
-):
-    channel_ids = [c.strip("<>#") for c in channels.split() if c.startswith("<#")]
-    if not channel_ids:
-        await interaction.response.send_message("No valid channel mentions found.", ephemeral=True)
-        return
-
-    # convert hour/minute from user timezone to Vancouver time (what the runner uses)
-    user_tz = get_tz_for_user(interaction.user.id)
-    now = datetime.now(user_tz)
-
-    # create a sample datetime in user tz and convert to Vancouver to get offset
-    sample = user_tz.localize(now.replace(hour=hour, minute=minute, second=0, microsecond=0))
-    sample_van = sample.astimezone(TZ)
-    converted_hour, converted_minute = sample_van.hour, sample_van.minute
-
-    sample_sat = user_tz.localize(now.replace(hour=saturday_hour, minute=saturday_minute, second=0, microsecond=0))
-    sample_sat_van = sample_sat.astimezone(TZ)
-    converted_saturday_hour, converted_saturday_minute = sample_sat_van.hour, sample_sat_van.minute
-
-    job_id = db.add_custom_job(
-        channel_ids, message,
-        converted_hour, converted_minute,
-        converted_saturday_hour, converted_saturday_minute,
-        str(interaction.user.id), start_date
-    )
-
-    next_run = sched.get_next_every_other_day(None, converted_hour, converted_minute, converted_saturday_hour, converted_saturday_minute, start_date)
-
-    await interaction.response.send_message(
-        f"Scheduled! ID: `{job_id}`. First run: `{format_dt(next_run, user_tz)}`",
-        ephemeral=True
-    )
-
-@tree.command(name="listcustomjobs", description="List all every-other-day jobs")
-async def listcustomjobs(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-
-    rows = db.get_all_custom_jobs()
-    if not rows:
-        await interaction.followup.send("No custom jobs scheduled.", ephemeral=True)
-        return
-
-    user_tz = get_tz_for_user(interaction.user.id)
-    lines = []
-    for row in rows:
-        job_id, channel_ids_str, message, hour, minute, saturday_hour, saturday_minute, start_date, last_run, _ = row
-
-        # calculate next run time
-        last_run_dt = datetime.fromisoformat(last_run).astimezone(TZ) if last_run else None
-        next_run = sched.get_next_every_other_day(
-            last_run_dt, hour, minute, saturday_hour, saturday_minute,
-            start_date if not last_run else None
-        )
-
-        next_run_str = format_dt(next_run, user_tz)
-
-        last = last_run if last_run else "never"
-        start = start_date if start_date else "none"
-        lines.append(
-            f"`ID {job_id}` | every other day @ {hour:02d}:{minute:02d} "
-            f"(fri->sat: {saturday_hour:02d}:{saturday_minute:02d}) "
-            f"| start: {start} | last run: {last} | next run: {next_run_str} | {message[:100]}{'...' if len(message) > 100 else ''}"
-        )
-
-    await interaction.followup.send("\n".join(lines), ephemeral=True)
-
-@tree.command(name="deletecustomjob", description="Delete an every-other-day job by ID")
-@app_commands.describe(id="The job ID from /listcustomjobs")
-async def deletecustomjob(interaction: discord.Interaction, id: int):
-    deleted = db.delete_custom_job(id)
-
-    if deleted:
-        await interaction.response.send_message(f"Deleted custom job `{id}`.", ephemeral=True)
-    else:
-        await interaction.response.send_message(f"No custom job found with ID `{id}`.", ephemeral=True)
 
 def get_tz_for_user(user_id: str) -> pytz.timezone:
     tz_str = db.get_user_timezone(str(user_id))
