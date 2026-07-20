@@ -1,6 +1,7 @@
 import os
 import sys
 import atexit
+import asyncio
 import discord
 from discord import app_commands
 from dotenv import load_dotenv
@@ -59,7 +60,12 @@ def format_dt(dt: datetime, user_tz: pytz.timezone = None) -> str:
 @tasks.loop(minutes=1)
 async def job_runner():
     now_utc = datetime.now(pytz.utc)
+    _task = asyncio.current_task()
+    _named = [t for t in asyncio.all_tasks() if t.get_name() == (_task.get_name() if _task else None)]
+    print(f"[DEBUG-dupe] tick start now_utc={now_utc.isoformat()} task_id={id(_task)} "
+          f"same_named_tasks_alive={len(_named)} total_tasks={len(asyncio.all_tasks())}")
     rows = db.get_all_messages()
+    print(f"[DEBUG-dupe] fetched {len(rows)} rows task_id={id(_task)}")
     for row in rows:
         row_id, channel_ids_str, message, fire_at, cron_expr, created_by, roster_list, advance_roster, last_run, \
             interval_days, interval_time, interval_start, interval_skip_weekday = row
@@ -81,9 +87,14 @@ async def job_runner():
                         last_run_dt = user_tz.localize(last_run_dt)
                     if abs((last_run_dt - prev).total_seconds()) < 60:
                         continue
+                print(f"[DEBUG-dupe] SENDING row_id={row_id} branch=cron occurrence={prev.isoformat()} "
+                      f"task_id={id(_task)} now={now_utc.isoformat()}")
+                # record before sending: if the process is killed mid-send (e.g. PC
+                # restart), the marker is already durable so we won't resend on restart
+                db.update_message_last_run(row_id, now_local.isoformat())
                 channel_ids = ast.literal_eval(channel_ids_str)
                 await sched.send_to_channels(client, channel_ids, message, roster_list, bool(advance_roster))
-                db.update_message_last_run(row_id, now_local.isoformat())
+                print(f"[DEBUG-dupe] SENT row_id={row_id} task_id={id(_task)}")
         elif interval_days:
             start = dt_date.fromisoformat(interval_start)
             today = now_local.date()
@@ -103,14 +114,22 @@ async def job_runner():
                     last_run_dt = user_tz.localize(last_run_dt)
                 if last_run_dt.astimezone(user_tz).date() == today:
                     continue
+            print(f"[DEBUG-dupe] SENDING row_id={row_id} branch=interval occurrence={today.isoformat()} "
+                  f"task_id={id(_task)} now={now_utc.isoformat()}")
+            db.update_message_last_run(row_id, now_local.isoformat())
             channel_ids = ast.literal_eval(channel_ids_str)
             await sched.send_to_channels(client, channel_ids, message, roster_list, bool(advance_roster))
-            db.update_message_last_run(row_id, now_local.isoformat())
+            print(f"[DEBUG-dupe] SENT row_id={row_id} task_id={id(_task)}")
         elif fire_at:
             fire_dt = datetime.fromisoformat(fire_at).astimezone(pytz.utc)
             if now_utc >= fire_dt and (now_utc - fire_dt).total_seconds() <= 60:
+                if last_run:
+                    continue
+                print(f"[DEBUG-dupe] SENDING row_id={row_id} branch=fire_at task_id={id(_task)} now={now_utc.isoformat()}")
+                db.update_message_last_run(row_id, now_local.isoformat())
                 channel_ids = ast.literal_eval(channel_ids_str)
                 await sched.send_to_channels(client, channel_ids, message, roster_list, bool(advance_roster))
+                print(f"[DEBUG-dupe] SENT row_id={row_id} task_id={id(_task)}")
 
 @job_runner.before_loop
 async def before_job_runner():
